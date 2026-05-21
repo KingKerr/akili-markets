@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+
+{% block main_content %}
+    <h1>Under Construction</h1>
+    <h1>{{ data.ticker }}</h1>
+
+    <h2>Recent Prices</h2>
+    <ul>
+      {% for row in data.price_series %}
+        <li>{{ row.trade_date }} | Close: {{ row.close }} | Return 1D: {{ row.return_1d }}</li>
+      {% endfor %}
+    </ul>
+
+    <h2>Recent News</h2>
+    <ul>
+      {% for row in data.news %}
+        <li>
+          <a href="{{ row.article_url }}" target="_blank" rel="noopener noreferrer">{{ row.title }}</a>
+          <p>{{ row.summary }}</p>
+        </li>
+      {% endfor %}
+    </ul>
+
+    <h2>Risk Themes</h2>
+    <ul>
+      {% for row in data.risk_summary %}
+        <li>{{ row.category_level_1 }} / {{ row.category_level_2 }} - {{ row.risk_title }}</li>
+      {% endfor %}
+    </ul>
+{% endblock %}
+    
