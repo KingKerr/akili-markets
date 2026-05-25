@@ -45,6 +45,7 @@ The `year` argument refers to the filing year (from `filing_date` in
    - `src/rag/chunking.py` splits documents into overlapping chunks,
      preserving section boundaries where possible.
    - `src/rag/embeddings.py` can be run as a CLI:
+   
      ```bash
      uv run python -m src.rag.embeddings --ticker AAPL --year 2025 --limit 200
      ```
