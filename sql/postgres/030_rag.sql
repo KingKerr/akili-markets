@@ -6,13 +6,14 @@ create table if not exists rag_chunk (
   section_name text,
   filing_date date,
   chunk_order int not null,
+  chunk_index integer not null,
   chunk_text text not null,
-  embedding vector(1536),
-  metadata jsonb,
+  embedding vector(1536) not null,
+  metadata jsonb not null default '{}'::jsonb,
   created_at timestamptz default now()
 );
 
-create index if not exists idx_rag_ticker_doc_type
+create unique index if not exists idx_rag_ticker_doc_type
   on rag_chunk (ticker, doc_type, filing_date desc);
 
 create index if not exists idx_rag_embedding

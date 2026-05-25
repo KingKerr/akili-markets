@@ -4,13 +4,19 @@ This module implements a retrieval‑augmented generation (RAG) flow that
 summarizes the major risks disclosed in a company’s 10‑K for a given
 ticker and year.
 
+The `year` argument refers to the filing year (from `filing_date` in
+`fact_filing_section`), not the calendar year of price or news data.
+
 ### High‑level design
 
 - **Data layer**
   - Source tables: `fact_filing_section` and `fact_risk_factor` with
     `ticker`, `form_type`, `filing_date`, `section_name`, and risk text.
-  - Warehouse facts/dims are published into Postgres, including a
-    `dim_ticker` referenced by all downstream fact tables.
+  - Warehouse facts/dims are published into Postgres, including:
+    - `dim_ticker`, with backfills from staged facts for late-arriving tickers.
+    - `dim_date`, with backfills from staged dates so `trade_date` FKs
+      in `fact_price_daily` always resolve.
+
 - **RAG storage (`rag_chunk`)**
   - Schema:
     - `chunk_id` (UUID primary key)
@@ -19,13 +25,13 @@ ticker and year.
     - `doc_id` (filing or risk‑factor id)
     - `section_name`
     - `filing_date`
-    - `chunk_order`
+    - `chunk_order` (zero-based index within each doc)
     - `chunk_text`
     - `embedding vector(1536)` (OpenAI `text-embedding-3-small`)
     - `metadata jsonb`
     - `created_at`
   - Indexes:
-    - `(ticker, doc_type, filing_date desc)` for metadata filtering
+    - `btree (ticker, doc_type, filing_date desc)` for metadata filtering
     - IVFFlat vector index on `embedding` for ANN search
   - Uniqueness:
     - `unique (ticker, doc_type, doc_id, chunk_order)` so chunk loads
@@ -38,10 +44,11 @@ ticker and year.
      for each ticker/filing from Postgres.
    - `src/rag/chunking.py` splits documents into overlapping chunks,
      preserving section boundaries where possible.
-   - `src/rag/embeddings.py`:
-     - deduplicates by `(ticker, doc_type, doc_id, chunk_order)`
-     - generates embeddings
-     - upserts rows into `rag_chunk`.
+   - `src/rag/embeddings.py` can be run as a CLI:
+     ```bash
+     uv run python -m src.rag.embeddings --ticker AAPL --year 2025 --limit 200
+     ```
+     This filters by ticker/year/doc_types, chunks the text, generates embeddings in batches, and upserts into `rag_chunk`.
 
 2. **Retrieval**
    - `src/rag/retrieve.py`:
@@ -58,17 +65,12 @@ ticker and year.
        - group risks into themes,
        - use only retrieved evidence,
        - avoid fabricating facts.
-   - `src/rag/service.py` exposes:
+   - `src/rag/service.py` can be run as a CLI:
 
-     ```python
-     summarize_ten_k_risks(ticker: str, year: int, limit: int = 8) -> dict
+     ```bash
+     uv run python -m src.rag.service AAPL 2025 --show-chunks
      ```
-
-     which:
-     - retrieves relevant chunks,
-     - builds a textual context block with `[Chunk N]` labels,
-     - calls the model with the task‑specific prompt,
-     - returns `{ticker, year, answer, chunks}`.
+     which which calls `summarize_ten_k_risks("AAPL", 2025)` and prints both the summary and retrieval metadata.
 
 ## How to Run
 
@@ -91,11 +93,40 @@ Set the required environment variables:
 - `POSTGRES_USER`
 - `POSTGRES_PASSWORD`
 - `OPENAI_API_KEY`
-- `MASSIVE_API_KEY`
 - `EMBEDDING_MODEL` (optional, defaults to `text-embedding-3-small`)
 - `CHAT_MODEL` (optional, defaults to `gpt-4.1-mini`)
 
 #### Steps
+
+> Note: Replace `AAPL` and `2025` with any ticker and filing year that
+> actually exist in your warehouse. For example, `NFLX 2026` or `NKE 2025`
+> depending on which filings you’ve ingested.
+
+Ingest news using ticker and date(YYYY-MM-DD):
+
+```bash
+uv run python -m src.ingest.ingest_news AAPL 2025-05-01
+```
+Ingest prices using stock ticker and date range:
+
+```bash
+uv run python -m src.ingest.ingest_prices AAPL 2025-01-01 2025-05-01
+```
+Ingest filings:
+
+```bash
+uv run python -m src.ingest.ingest_filings AAPL
+```
+Run your transforms for the raw data with DuckDB:
+
+```bash
+uv run python src/transforms/duckdb_stage.py
+```
+Publish to Postgres:
+
+```bash
+uv run python src/transforms/publish_postgres.py
+```
 
 Create the RAG schema in Postgres:
 
@@ -106,13 +137,13 @@ psql "$DATABASE_URL" -f sql/030_rag.sql
 Build and load embeddings into `rag_chunk`:
 
 ```bash
-uv run python -m src.rag.embeddings
+uv run python -m src.rag.embeddings --ticker AAPL --year 2025
 ```
 
 Run the 10-K risk summary service:
 
 ```bash
-uv run python -m src.rag.service
+uv run python -m src.rag.service AAPL 2025 --show-chunks
 ```
 
 Expected output:
@@ -158,10 +189,10 @@ psql "$DATABASE_URL" -f sql/030_rag.sql
 
 #### 4. Build chunk embeddings
 
-Load filing sections and risk factors from Postgres, chunk the text, generate embeddings, and insert them into `rag_chunk`.
+Load filing sections and risk factors from Postgres, chunk the text, generate embeddings, and insert them into `rag_chunk`. You can do so like this:
 
 ```bash
-uv run python -m src.rag.embeddings
+uv run python -m src.rag.embeddings --ticker AAPL --year 2025 --limit 200
 ```
 
 #### 5. Run the RAG service
@@ -169,7 +200,7 @@ uv run python -m src.rag.embeddings
 Execute the end-to-end 10-K risk summary example:
 
 ```bash
-uv run python -m src.rag.service
+uv run python -m src.rag.service AAPL 2025 --show-chunks
 ```
 
 ### Notes
@@ -183,6 +214,8 @@ uv run python -m src.rag.service
   - `src.rag.embeddings` has been run successfully,
   - `rag_chunk` contains rows,
   - the requested ticker/year exists in the underlying filing data.
+  (i.e., `fact_filing_section` / `fact_risk_factor` contain rows with
+  `ticker` and `extract(year from filing_date) = year`).
 - The first embedding load may take some time depending on corpus size and API latency.
 
 ### Example
@@ -190,13 +223,13 @@ uv run python -m src.rag.service
 Run the sample service entry point:
 
 ```bash
-uv run python -m src.rag.service
+uv run python -m src.rag.service AAPL 2025 --show-chunks
 ```
 
 This executes:
 
 ```python
-summarize_ten_k_risks("AAPL", 2024)
+summarize_ten_k_risks("AAPL", 2025)
 ```
 
 and returns:

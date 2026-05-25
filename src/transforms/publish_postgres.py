@@ -28,6 +28,9 @@ def postgres_url():
 
     return f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{db}"
 
+def get_engine():
+    return create_engine(postgres_url())
+
 def load_df(con, query: str) -> pd.DataFrame:
     return con.execute(query).df()
 
@@ -81,7 +84,11 @@ def upsert_dataframe(engine, df, target_table, temp_table, conflict_cols, update
 
     print(f"[ok] {target_table}: upserted {len(df)} rows")
     return len(df)
-
+"""
+----------------------------
+Publishing Dimension Tables
+----------------------------
+"""
 def publish_dim_date(con, engine):
     df = safe_load_df(con, """
         select
@@ -164,13 +171,142 @@ def publish_dim_ticker(con, engine):
         ],
     )
 
+"""
+-------------------------
+Backfills for Dim Date
+-------------------------
+"""
+def backfill_dim_date_from_staging(engine, con):
+    staged = safe_load_df(con, """
+        select distinct date_day
+        from (
+            select cast(trade_date as date) as date_day from mart_price_features
+            union
+            select cast(published_at as date) as date_day from stg_news
+            union
+            select cast(filing_date as date) as date_day from stg_filing_sections
+            union
+            select cast(filing_date as date) as date_day from stg_risk_factors
+        ) d
+        where date_day is not null
+        order by date_day
+    """)
+
+    if staged.empty:
+        print("[skip] dim_date backfill: no staged dates")
+        return 0
+
+    df = staged.copy()
+    df["date_day"] = pd.to_datetime(df["date_day"])
+    df["year"] = df["date_day"].dt.year
+    df["quarter"] = df["date_day"].dt.quarter
+    df["month"] = df["date_day"].dt.month
+    df["day_of_month"] = df["date_day"].dt.day
+    df["day_of_week"] = df["date_day"].dt.dayofweek + 1
+    df["is_weekend"] = df["day_of_week"].isin([6, 7])
+    df["date_day"] = df["date_day"].dt.date
+
+    return upsert_dataframe(
+        engine,
+        df,
+        "dim_date",
+        "_tmp_dim_date_backfill",
+        ["date_day"],
+        [
+            "year",
+            "quarter",
+            "month",
+            "day_of_month",
+            "day_of_week",
+            "is_weekend",
+        ],
+    )
+
+"""
+-------------------------
+Backfills for Dim Ticker
+-------------------------
+"""
+def backfill_dim_ticker_from_staging(engine, con):
+    staged = safe_load_df(con, """
+        select distinct ticker from (
+            select ticker from mart_price_features
+            union
+            select ticker from stg_news
+            union
+            select ticker from stg_filing_sections
+            union
+            select ticker from stg_risk_factors
+        ) t
+        where ticker is not null
+    """)
+
+    if staged.empty:
+        print("[skip] dim_ticker backfill: no staged tickers")
+        return 0
+
+    with engine.begin() as conn:
+        existing = {
+            row[0]
+            for row in conn.execute(text("select ticker from dim_ticker")).fetchall()
+        }
+
+        missing = sorted(set(staged["ticker"]) - existing)
+
+        if not missing:
+            print("[ok] dim_ticker backfill: no missing tickers")
+            return 0
+        
+        for ticker in missing:
+            conn.execute(text("""
+                insert into dim_ticker (
+                    ticker,
+                    company_name,
+                    primary_exchange,
+                    sector,
+                    industry,
+                    sic_code,
+                    market_cap,
+                    cik,
+                    locale,
+                    currency_name,
+                    active,
+                    listing_date,
+                    updated_at
+                )
+                values (
+                    :ticker,
+                    null,
+                    null,
+                    null,
+                    null,
+                    null,
+                    null,
+                    null,
+                    null,
+                    null,
+                    null,
+                    null,
+                    current_timestamp
+                )
+                on conflict (ticker) do nothing
+            """), {"ticker": ticker})
+    print(f"[ok] dim_ticker backfill: inserted {len(missing)} placeholder tickers")
+    return len(missing)
+
 # Adding a dependency check before proceeding with publishing
 # This will help prevent any failures due to a FK not being loaded for fact_price_daily
+"""
 def dim_ticker_ready(engine) -> bool:
     with engine.begin() as conn:
         result = conn.execute(text("select count(*) from dim_ticker")).scalar()
     return result > 0
-
+"""
+"""
+---------------------
+Publishing Fact Tables
+---------------------
+"""
 def publish_fact_price_daily(con, engine):
     df = safe_load_df(con, """
         select
@@ -219,7 +355,6 @@ def publish_fact_price_daily(con, engine):
         ]
     )
 
-    
 def normalize_array_value(x):
     if isinstance(x, np.ndarray):
         return x.tolist()
@@ -228,6 +363,7 @@ def normalize_array_value(x):
     if isinstance(x, float) and pd.isna(x):
         return []
     return x
+
 
 def publish_fact_news(con, engine):
     df = safe_load_df(con, """
@@ -372,11 +508,20 @@ def publish_fact_risk_factor(con, engine):
 def main():
     con = duckdb.connect(DUCKDB_PATH)
     engine = create_engine(postgres_url())
+    # Publish Dimensions First
+    #publish_dim_date(con, engine)
     publish_dim_ticker(con, engine)
+
+    # Perform Backfill in case any dates & tickers are missing from staged Facts
+    backfill_dim_date_from_staging(engine, con)
+    backfill_dim_ticker_from_staging(engine, con)
+    """
     if dim_ticker_ready(engine):
         publish_fact_price_daily(con, engine)
     else:
         print("[skip] fact_price_daily: dim_ticker is empty")
+    """
+    # Now publish Facts
     publish_fact_price_daily(con, engine)
     publish_fact_news(con, engine)
     publish_fact_filing_section(con, engine)

@@ -1,4 +1,5 @@
 import os
+import argparse
 from openai import OpenAI
 from src.rag.retrieve import retrieve_chunks
 from src.rag.prompts import TEN_K_RISK_SUMMARY_PROMPT
@@ -21,6 +22,8 @@ def build_context(chunks):
     return "\n---\n".join(parts)
 
 def summarize_ten_k_risks(ticker: str, year: int, limit: int = 8):
+    ticker = ticker.upper().strip()
+    year = int(year)
     query = f"Summarize the main risks disclosed by {ticker} in its {year} 10-K risk factors."
     chunks = retrieve_chunks(
         ticker=ticker,
@@ -68,7 +71,58 @@ Retrieved evidence:
         "chunks": chunks,
     }
 
-if __name__ == "__main__":
-    result = summarize_ten_k_risks("AAPL", 2024)
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description = "Summarize 10-K risks for a ticker and year using RAG."
+    )
+    parser.add_argument(
+        "ticker",
+        type=str,
+        help="Ticker symbol, e.g. NFL"
+    )
+    parser.add_argument(
+        "year",
+        type=int, 
+        help="Filing year to retrieve, e.g. 2026"
+    )
+    parser.add_argument(
+        "--limit",
+        type=int, 
+        default=8, 
+        help="Maximum number of trunks to retrieve (default: 8)"
+    )
+    parser.add_argument(
+        "--show-chunks",
+        action="store_true",
+        help="Print retrieved chunk metadata for debugging"
+    )
+    return parser.parse_args()
+
+def main():
+    args = parse_args()
+    result = summarize_ten_k_risks(
+        ticker=args.ticker,
+        year=args.year, 
+        limit=args.limit,
+    )
+    if result["answer"] is None: 
+        print(result.get("message", "No answer was generated."))
+        print(f"Retrieved {len(result['chunks'])} chunks")
+        return
+
     print(result["answer"])
     print(f"Retrieved {len(result['chunks'])} chunks")
+
+    if args.show_chunks:
+        for i, c in enumerate(result["chunks"], start=1):
+            print(
+                f"[{i}] "
+                f"ticker={c.get('ticker')} | "
+                f"doc_type={c.get('doc_type')} | "
+                f"section_name={c.get('section_name')} | "
+                f"filing_date={c.get('filing_date')} | "
+                f"similarity={round(c.get('similarity', 0), 4)}"
+            )
+
+if __name__ == "__main__":
+    main()
